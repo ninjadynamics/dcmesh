@@ -21,7 +21,7 @@
  * File format magic and version
  * ---------------------------------------------------------------- */
 #define DCMESH_MAGIC      0x4D434431  /* "DCM1" in little-endian */
-#define DCMESH_VERSION    1
+#define DCMESH_VERSION    2           /* v2: added vertex_map */
 
 /* -------------------------------------------------------------------
  * On-disk vertex format — 24 bytes, matches rlgl batcher format
@@ -55,8 +55,9 @@ typedef struct {
     uint32_t strip_count;       /* Number of triangle strips */
     uint32_t is_opaque;         /* 1 = opaque (Patch E eligible), 0 = translucent */
     /* Followed in file by:
-     *   DCVertex vertices[vertex_count]
-     *   DCStrip  strips[strip_count]
+     *   DCVertex  vertices[vertex_count]
+     *   DCStrip   strips[strip_count]
+     *   uint16_t  vertex_map[vertex_count]  -- maps strip vertex -> source vertex
      */
 } DCSubmeshHeader;
 
@@ -82,6 +83,7 @@ typedef struct {
     uint32_t strip_count;
     DCVertex *vertices;         /* Allocated vertex array */
     DCStrip  *strips;           /* Allocated strip array */
+    uint16_t *vertex_map;       /* Maps strip vertex -> original vertex index */
 } DCSubmesh;
 
 /* -------------------------------------------------------------------
@@ -96,13 +98,15 @@ typedef struct {
  * Registry handle — used to associate raylib Mesh with DCMeshData
  *
  * On Dreamcast GL 1.1, Mesh.vaoId is unused (VAOs are GL 3.3+).
- * We repurpose it as an index into a global registry:
- *   0 = no DCMesh data (standard GLdc path)
- *   >0 = registry index (1-based, so actual index = vaoId - 1)
+ * We encode both registry index AND submesh index in vaoId:
+ *   Bits 31-24: 0xDC prefix (magic tag)
+ *   Bits 23-8:  registry index (up to 65535 entries)
+ *   Bits 7-0:   submesh index (up to 256 submeshes per entry)
  * ---------------------------------------------------------------- */
 #define DCMESH_REGISTRY_MAGIC_BASE  0xDC000000
 #define DCMESH_IS_REGISTRY_ID(id)   (((id) & 0xFF000000) == DCMESH_REGISTRY_MAGIC_BASE)
-#define DCMESH_REGISTRY_INDEX(id)   ((id) & 0x00FFFFFF)
-#define DCMESH_MAKE_ID(idx)         (DCMESH_REGISTRY_MAGIC_BASE | ((idx) & 0x00FFFFFF))
+#define DCMESH_REGISTRY_INDEX(id)   (((id) & 0x00FFFF00) >> 8)
+#define DCMESH_SUBMESH_INDEX(id)    ((id) & 0x000000FF)
+#define DCMESH_MAKE_ID(reg, sub)    (DCMESH_REGISTRY_MAGIC_BASE | (((reg) & 0xFFFF) << 8) | ((sub) & 0xFF))
 
 #endif /* DCMESH_H */

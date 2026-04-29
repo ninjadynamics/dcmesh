@@ -46,6 +46,7 @@
  * Helpers
  * ---------------------------------------------------------------- */
 
+
 static float* accessor_to_floats(const cgltf_accessor* acc, int components) {
     size_t count = acc->count;
     float* out = (float*)malloc(count * components * sizeof(float));
@@ -82,9 +83,11 @@ typedef struct {
     DCSubmeshHeader header;
     DCVertex* vertices;
     DCStrip* strips;
+    uint16_t* vertex_map;       /* Maps strip vertex -> original vertex index */
 } ProcessedSubmesh;
 
-static int process_primitive(const cgltf_primitive* prim, int mat_index, ProcessedSubmesh* out) {
+static int process_primitive(const cgltf_primitive* prim, int mat_index,
+                            const float* node_xform, ProcessedSubmesh* out) {
     if (prim->type != cgltf_primitive_type_triangles) {
         fprintf(stderr, "  Skipping non-triangle primitive (type=%d)\n", prim->type);
         return 0;
@@ -124,6 +127,20 @@ static int process_primitive(const cgltf_primitive* prim, int mat_index, Process
     float* texcoords = uv_acc ? accessor_to_floats(uv_acc, 2) : NULL;
     float* colors = col_acc ? accessor_to_floats(col_acc, 4) : NULL;
     unsigned int* indices = accessor_to_indices(prim->indices);
+
+    /* Apply node world transform to positions (matches raylib's LoadModel behavior).
+     * node_xform is a column-major 4x4 matrix from cgltf_node_transform_world(). */
+    if (positions && node_xform) {
+        for (size_t i = 0; i < vertex_count; i++) {
+            float x = positions[i * 3 + 0];
+            float y = positions[i * 3 + 1];
+            float z = positions[i * 3 + 2];
+            /* Column-major multiply: M * [x, y, z, 1] */
+            positions[i * 3 + 0] = node_xform[0]*x + node_xform[4]*y + node_xform[8]*z  + node_xform[12];
+            positions[i * 3 + 1] = node_xform[1]*x + node_xform[5]*y + node_xform[9]*z  + node_xform[13];
+            positions[i * 3 + 2] = node_xform[2]*x + node_xform[6]*y + node_xform[10]*z + node_xform[14];
+        }
+    }
 
     if (!positions || !indices) {
         free(positions); free(texcoords); free(colors); free(indices);
@@ -177,6 +194,7 @@ static int process_primitive(const cgltf_primitive* prim, int mat_index, Process
 
     DCVertex* expanded = (DCVertex*)malloc(total_expanded * sizeof(DCVertex));
     DCStrip* strips = (DCStrip*)malloc(num_strips * sizeof(DCStrip));
+    uint16_t* vertex_map = (uint16_t*)malloc(total_expanded * sizeof(uint16_t));
 
     /* Default color: opaque white */
     uint32_t default_color = pack_color_bgra(1.0f, 1.0f, 1.0f, 1.0f);
@@ -194,7 +212,9 @@ static int process_primitive(const cgltf_primitive* prim, int mat_index, Process
 
                 for (size_t j = run_start; j < i; j++) {
                     unsigned int vi = strip_indices[j];
-                    DCVertex* dv = &expanded[vert_offset++];
+                    DCVertex* dv = &expanded[vert_offset];
+                    vertex_map[vert_offset] = (uint16_t)vi;
+                    vert_offset++;
 
                     dv->x = positions[vi * 3 + 0];
                     dv->y = positions[vi * 3 + 1];
@@ -236,6 +256,7 @@ static int process_primitive(const cgltf_primitive* prim, int mat_index, Process
     out->header.is_opaque = (uint32_t)is_opaque;
     out->vertices = expanded;
     out->strips = strips;
+    out->vertex_map = vertex_map;
 
     float ratio = (float)total_expanded / (float)(index_count);
     printf("  Result: %zu strips, %zu expanded vertices (%.1f%% of triangle list)\n",
@@ -307,6 +328,22 @@ int main(int argc, char** argv) {
         printf("\nMesh %zu: \"%s\" (%zu primitives)\n", m,
                mesh->name ? mesh->name : "(unnamed)", mesh->primitives_count);
 
+        /* Find the node that references this mesh and get its world transform.
+         * This matches what raylib's LoadModel does — it applies node transforms
+         * to vertex positions during loading. Without this, dcmesh vertices
+         * would be in raw accessor space (wrong scale/rotation/position). */
+        float node_xform[16];
+        int has_xform = 0;
+        for (cgltf_size ni = 0; ni < data->nodes_count; ni++) {
+            if (data->nodes[ni].mesh == mesh) {
+                cgltf_node_transform_world(&data->nodes[ni], node_xform);
+                has_xform = 1;
+                printf("  Node transform found (node \"%s\")\n",
+                       data->nodes[ni].name ? data->nodes[ni].name : "(unnamed)");
+                break;
+            }
+        }
+
         for (cgltf_size p = 0; p < mesh->primitives_count; p++) {
             cgltf_primitive* prim = &mesh->primitives[p];
 
@@ -321,7 +358,8 @@ int main(int argc, char** argv) {
                 }
             }
 
-            if (process_primitive(prim, mat_idx, &submeshes[submesh_count])) {
+            if (process_primitive(prim, mat_idx, has_xform ? node_xform : NULL,
+                                  &submeshes[submesh_count])) {
                 total_vertices += submeshes[submesh_count].header.vertex_count;
                 total_strips += submeshes[submesh_count].header.strip_count;
                 submesh_count++;
@@ -359,6 +397,7 @@ int main(int argc, char** argv) {
         fwrite(&sm->header, sizeof(DCSubmeshHeader), 1, fout);
         fwrite(sm->vertices, sizeof(DCVertex), sm->header.vertex_count, fout);
         fwrite(sm->strips, sizeof(DCStrip), sm->header.strip_count, fout);
+        fwrite(sm->vertex_map, sizeof(uint16_t), sm->header.vertex_count, fout);
     }
 
     fclose(fout);
@@ -371,13 +410,15 @@ int main(int argc, char** argv) {
            sizeof(DCMeshFileHeader)
            + submesh_count * sizeof(DCSubmeshHeader)
            + total_vertices * sizeof(DCVertex)
-           + total_strips * sizeof(DCStrip));
+           + total_strips * sizeof(DCStrip)
+           + total_vertices * sizeof(uint16_t));
     printf("Written to:     %s\n", output_path);
 
     /* Cleanup */
     for (size_t i = 0; i < submesh_count; i++) {
         free(submeshes[i].vertices);
         free(submeshes[i].strips);
+        free(submeshes[i].vertex_map);
     }
     free(submeshes);
     cgltf_free(data);

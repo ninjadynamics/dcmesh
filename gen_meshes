@@ -1,0 +1,3 @@
+#!/bin/bash
+./dcmesh.exe ../assets/dc/f22.glb
+./dcmesh.exe ../assets/dc/enemy.glb
