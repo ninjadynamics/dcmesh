@@ -1,7 +1,7 @@
 /*
  * dcmesh.h — DCMesh binary format definition
  *
- * Shared between the PC-side offline converter (glb_to_dcmesh) and the
+ * Shared between the PC-side offline converter (dcmesh) and the
  * Dreamcast runtime loader. Defines the .dcmesh file format, vertex
  * layout, and strip structures.
  *
