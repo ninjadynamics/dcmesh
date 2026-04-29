@@ -1,5 +1,5 @@
 /*
- * glb_to_dcmesh.c — Offline GLB to DCMesh converter
+ * dcmesh.c — Offline GLB to DCMesh converter
  *
  * Converts .glb (glTF binary) models into .dcmesh files optimized for
  * Dreamcast triangle strip rendering.
@@ -13,12 +13,12 @@
  *   6. Write .dcmesh binary file
  *
  * Build (on PC, not cross-compiled):
- *   cc -O2 -o glb_to_dcmesh glb_to_dcmesh.c \
+ *   cc -O2 -o dcmesh dcmesh.c \
  *      -I/path/to/meshoptimizer/extern \
  *      -L/path/to/meshoptimizer/build -lmeshoptimizer -lm
  *
  * Or with meshoptimizer sources compiled directly:
- *   cc -O2 -o glb_to_dcmesh glb_to_dcmesh.c \
+ *   cc -O2 -o dcmesh dcmesh.c \
  *      /path/to/meshoptimizer/src/stripifier.cpp \
  *      /path/to/meshoptimizer/src/vcacheoptimizer.cpp \
  *      /path/to/meshoptimizer/src/indexgenerator.cpp \
@@ -26,7 +26,7 @@
  *      -I/path/to/meshoptimizer/src -lstdc++ -lm
  *
  * Usage:
- *   glb_to_dcmesh input.glb [output.dcmesh]
+ *   dcmesh input.glb [output.dcmesh]
  *
  * If output is not specified, writes to input.dcmesh (replacing .glb extension).
  */
@@ -277,7 +277,7 @@ static int process_primitive(const cgltf_primitive* prim, int mat_index,
  * ---------------------------------------------------------------- */
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: glb_to_dcmesh input.glb [output.dcmesh]\n");
+        fprintf(stderr, "Usage: dcmesh input.glb [output.dcmesh]\n");
         return 1;
     }
 
