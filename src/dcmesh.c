@@ -285,12 +285,25 @@ int main(int argc, char** argv) {
     char output_path[512];
 
     if (argc >= 3) {
-        strncpy(output_path, argv[2], sizeof(output_path) - 1);
+        size_t length = strlen(argv[2]);
+        if (length >= sizeof(output_path)) {
+            fprintf(stderr, "Error: Output path is too long\n");
+            return 1;
+        }
+        memcpy(output_path, argv[2], length + 1);
     } else {
-        strncpy(output_path, input_path, sizeof(output_path) - 1);
-        char* dot = strrchr(output_path, '.');
-        if (dot) strcpy(dot, ".dcmesh");
-        else strcat(output_path, ".dcmesh");
+        const char* base = input_path;
+        for (const char* p = input_path; *p; ++p)
+            if (*p == '/' || *p == '\\') base = p + 1;
+        const char* dot = strrchr(base, '.');
+        size_t stem = dot ? (size_t)(dot - input_path) : strlen(input_path);
+        const char suffix[] = ".dcmesh";
+        if (stem > sizeof(output_path) - sizeof(suffix)) {
+            fprintf(stderr, "Error: Output path is too long\n");
+            return 1;
+        }
+        memcpy(output_path, input_path, stem);
+        memcpy(output_path + stem, suffix, sizeof(suffix));
     }
 
     printf("Converting: %s -> %s\n", input_path, output_path);
@@ -375,11 +388,11 @@ int main(int argc, char** argv) {
     }
 
     /* Write .dcmesh file */
+    int exit_code = 1;
     FILE* fout = fopen(output_path, "wb");
     if (!fout) {
         fprintf(stderr, "Error: Cannot open %s for writing\n", output_path);
-        /* cleanup omitted for brevity */
-        return 1;
+        goto cleanup;
     }
 
     /* File header */
@@ -389,18 +402,24 @@ int main(int argc, char** argv) {
     fhdr.submesh_count = (uint32_t)submesh_count;
     fhdr.total_vertices = total_vertices;
     fhdr.total_strips = total_strips;
-    fwrite(&fhdr, sizeof(fhdr), 1, fout);
+    int write_ok = fwrite(&fhdr, sizeof(fhdr), 1, fout) == 1;
 
     /* Write each submesh: header, vertices, strips */
-    for (size_t i = 0; i < submesh_count; i++) {
+    for (size_t i = 0; write_ok && i < submesh_count; i++) {
         ProcessedSubmesh* sm = &submeshes[i];
-        fwrite(&sm->header, sizeof(DCSubmeshHeader), 1, fout);
-        fwrite(sm->vertices, sizeof(DCVertex), sm->header.vertex_count, fout);
-        fwrite(sm->strips, sizeof(DCStrip), sm->header.strip_count, fout);
-        fwrite(sm->vertex_map, sizeof(uint16_t), sm->header.vertex_count, fout);
+        write_ok = fwrite(&sm->header, sizeof(DCSubmeshHeader), 1, fout) == 1 &&
+            fwrite(sm->vertices, sizeof(DCVertex), sm->header.vertex_count, fout) == sm->header.vertex_count &&
+            fwrite(sm->strips, sizeof(DCStrip), sm->header.strip_count, fout) == sm->header.strip_count &&
+            fwrite(sm->vertex_map, sizeof(uint16_t), sm->header.vertex_count, fout) == sm->header.vertex_count;
     }
 
-    fclose(fout);
+    if (fclose(fout) != 0) write_ok = 0;
+    if (!write_ok) {
+        fprintf(stderr, "Error: Failed writing %s\n", output_path);
+        if (remove(output_path) != 0)
+            fprintf(stderr, "Error: Could not remove incomplete output %s\n", output_path);
+        goto cleanup;
+    }
 
     printf("\n=== Summary ===\n");
     printf("Submeshes:      %zu\n", submesh_count);
@@ -413,8 +432,10 @@ int main(int argc, char** argv) {
            + total_strips * sizeof(DCStrip)
            + total_vertices * sizeof(uint16_t));
     printf("Written to:     %s\n", output_path);
+    exit_code = 0;
 
     /* Cleanup */
+cleanup:
     for (size_t i = 0; i < submesh_count; i++) {
         free(submeshes[i].vertices);
         free(submeshes[i].strips);
@@ -422,5 +443,5 @@ int main(int argc, char** argv) {
     }
     free(submeshes);
     cgltf_free(data);
-    return 0;
+    return exit_code;
 }
