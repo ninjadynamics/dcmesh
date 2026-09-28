@@ -47,22 +47,43 @@
  * ---------------------------------------------------------------- */
 
 
-static float* accessor_to_floats(const cgltf_accessor* acc, int components) {
-    size_t count = acc->count;
-    float* out = (float*)malloc(count * components * sizeof(float));
-    if (!out) return NULL;
+/* Reads `count` elements of `components` floats. A VEC3 color leaves its
+ * alpha at 1 (glTF's implied opaque alpha). NULL after printing why. */
+static float* accessor_to_floats(const cgltf_accessor* acc, size_t count, int components,
+                                 const char* what) {
+    float* out = (float*)malloc((count ? count : 1) * components * sizeof(float));
+    if (!out) {
+        fprintf(stderr, "Error: out of memory reading %s\n", what);
+        return NULL;
+    }
     for (size_t i = 0; i < count; i++) {
-        cgltf_accessor_read_float(acc, i, &out[i * components], components);
+        out[i * components + components - 1] = 1.0f;
+        if (!cgltf_accessor_read_float(acc, i, &out[i * components], components)) {
+            fprintf(stderr, "Error: cannot read %s element %zu\n", what, i);
+            free(out);
+            return NULL;
+        }
     }
     return out;
 }
 
-static unsigned int* accessor_to_indices(const cgltf_accessor* acc) {
+/* Reads the index list, rejecting any index outside the vertex range. */
+static unsigned int* accessor_to_indices(const cgltf_accessor* acc, size_t vertex_count) {
     size_t count = acc->count;
-    unsigned int* out = (unsigned int*)malloc(count * sizeof(unsigned int));
-    if (!out) return NULL;
+    unsigned int* out = (unsigned int*)malloc((count ? count : 1) * sizeof(unsigned int));
+    if (!out) {
+        fprintf(stderr, "Error: out of memory reading indices\n");
+        return NULL;
+    }
     for (size_t i = 0; i < count; i++) {
-        out[i] = (unsigned int)cgltf_accessor_read_index(acc, i);
+        cgltf_size index = cgltf_accessor_read_index(acc, i);
+        if (index >= vertex_count) {
+            fprintf(stderr, "Error: index %zu at %zu is outside %zu vertices\n",
+                    (size_t)index, i, vertex_count);
+            free(out);
+            return NULL;
+        }
+        out[i] = (unsigned int)index;
     }
     return out;
 }
@@ -77,7 +98,8 @@ static uint32_t pack_color_bgra(float r, float g, float b, float a) {
 }
 
 /* -------------------------------------------------------------------
- * Process one glTF primitive into a DCSubmesh
+ * Process one glTF primitive into a DCSubmesh: 1 converted, 0 skipped,
+ * -1 invalid input or out of memory (the conversion fails).
  * ---------------------------------------------------------------- */
 typedef struct {
     DCSubmeshHeader header;
@@ -122,11 +144,36 @@ static int process_primitive(const cgltf_primitive* prim, int mat_index,
     printf("  Primitive: %zu vertices, %zu indices (%zu triangles)\n",
            vertex_count, index_count, index_count / 3);
 
+    /* The format limits and attribute shapes every consumer below relies on. */
+    if (pos_acc->type != cgltf_type_vec3 ||
+        (uv_acc && uv_acc->type != cgltf_type_vec2) ||
+        (col_acc && col_acc->type != cgltf_type_vec3 && col_acc->type != cgltf_type_vec4)) {
+        fprintf(stderr, "Error: unsupported position/texcoord/color accessor type\n");
+        return -1;
+    }
+    if ((uv_acc && uv_acc->count < vertex_count) || (col_acc && col_acc->count < vertex_count)) {
+        fprintf(stderr, "Error: texcoord/color accessor is shorter than the positions\n");
+        return -1;
+    }
+    if (vertex_count > 65536) {
+        fprintf(stderr, "Error: %zu vertices; the 16-bit vertex map holds at most 65536\n",
+                vertex_count);
+        return -1;
+    }
+    if (index_count == 0 || index_count % 3 != 0) {
+        fprintf(stderr, "Error: %zu indices is not a whole triangle list\n", index_count);
+        return -1;
+    }
+
     /* Read attribute data */
-    float* positions = accessor_to_floats(pos_acc, 3);
-    float* texcoords = uv_acc ? accessor_to_floats(uv_acc, 2) : NULL;
-    float* colors = col_acc ? accessor_to_floats(col_acc, 4) : NULL;
-    unsigned int* indices = accessor_to_indices(prim->indices);
+    float* positions = accessor_to_floats(pos_acc, vertex_count, 3, "positions");
+    float* texcoords = uv_acc ? accessor_to_floats(uv_acc, vertex_count, 2, "texcoords") : NULL;
+    float* colors = col_acc ? accessor_to_floats(col_acc, vertex_count, 4, "colors") : NULL;
+    unsigned int* indices = accessor_to_indices(prim->indices, vertex_count);
+    if (!positions || (uv_acc && !texcoords) || (col_acc && !colors) || !indices) {
+        free(positions); free(texcoords); free(colors); free(indices);
+        return -1;
+    }
 
     /* Apply node world transform to positions (matches raylib's LoadModel behavior).
      * node_xform is a column-major 4x4 matrix from cgltf_node_transform_world(). */
@@ -142,19 +189,24 @@ static int process_primitive(const cgltf_primitive* prim, int mat_index,
         }
     }
 
-    if (!positions || !indices) {
-        free(positions); free(texcoords); free(colors); free(indices);
-        return 0;
-    }
-
     /* Step 1: Optimize vertex cache ordering for strip generation */
     unsigned int* optimized = (unsigned int*)malloc(index_count * sizeof(unsigned int));
+    if (!optimized) {
+        fprintf(stderr, "Error: out of memory optimizing the vertex cache\n");
+        free(positions); free(texcoords); free(colors); free(indices);
+        return -1;
+    }
     meshopt_optimizeVertexCacheStrip(optimized, indices, index_count, vertex_count);
     free(indices);
 
     /* Step 2: Stripify — use ~0 as restart index, then split on it */
     size_t strip_bound = meshopt_stripifyBound(index_count);
     unsigned int* strip_indices = (unsigned int*)malloc(strip_bound * sizeof(unsigned int));
+    if (!strip_indices) {
+        fprintf(stderr, "Error: out of memory stripifying\n");
+        free(positions); free(texcoords); free(colors); free(optimized);
+        return -1;
+    }
     size_t strip_index_count = meshopt_stripify(strip_indices, optimized,
                                                  index_count, vertex_count, ~0u);
     free(optimized);
@@ -195,6 +247,12 @@ static int process_primitive(const cgltf_primitive* prim, int mat_index,
     DCVertex* expanded = (DCVertex*)malloc(total_expanded * sizeof(DCVertex));
     DCStrip* strips = (DCStrip*)malloc(num_strips * sizeof(DCStrip));
     uint16_t* vertex_map = (uint16_t*)malloc(total_expanded * sizeof(uint16_t));
+    if (!expanded || !strips || !vertex_map) {
+        fprintf(stderr, "Error: out of memory expanding strips\n");
+        free(expanded); free(strips); free(vertex_map);
+        free(positions); free(texcoords); free(colors); free(strip_indices);
+        return -1;
+    }
 
     /* Default color: opaque white */
     uint32_t default_color = pack_color_bgra(1.0f, 1.0f, 1.0f, 1.0f);
@@ -324,6 +382,13 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    result = cgltf_validate(data);
+    if (result != cgltf_result_success) {
+        fprintf(stderr, "Error: %s is not valid glTF (error %d)\n", input_path, result);
+        cgltf_free(data);
+        return 1;
+    }
+
     printf("Loaded: %zu meshes, %zu materials\n", data->meshes_count, data->materials_count);
 
     /* Process all primitives across all meshes */
@@ -331,10 +396,17 @@ int main(int argc, char** argv) {
     for (cgltf_size m = 0; m < data->meshes_count; m++)
         max_submeshes += data->meshes[m].primitives_count;
 
-    ProcessedSubmesh* submeshes = (ProcessedSubmesh*)calloc(max_submeshes, sizeof(ProcessedSubmesh));
+    ProcessedSubmesh* submeshes = (ProcessedSubmesh*)calloc(max_submeshes ? max_submeshes : 1,
+                                                            sizeof(ProcessedSubmesh));
     size_t submesh_count = 0;
     uint32_t total_vertices = 0;
     uint32_t total_strips = 0;
+    int exit_code = 1;
+    if (!submeshes) {
+        fprintf(stderr, "Error: out of memory for %zu submeshes\n", max_submeshes);
+        cgltf_free(data);
+        return 1;
+    }
 
     for (cgltf_size m = 0; m < data->meshes_count; m++) {
         cgltf_mesh* mesh = &data->meshes[m];
@@ -371,8 +443,14 @@ int main(int argc, char** argv) {
                 }
             }
 
-            if (process_primitive(prim, mat_idx, has_xform ? node_xform : NULL,
-                                  &submeshes[submesh_count])) {
+            int processed = process_primitive(prim, mat_idx, has_xform ? node_xform : NULL,
+                                              &submeshes[submesh_count]);
+            if (processed < 0) {
+                fprintf(stderr, "Error: mesh %zu primitive %zu cannot be converted\n",
+                        (size_t)m, (size_t)p);
+                goto cleanup;
+            }
+            if (processed) {
                 total_vertices += submeshes[submesh_count].header.vertex_count;
                 total_strips += submeshes[submesh_count].header.strip_count;
                 submesh_count++;
@@ -388,7 +466,6 @@ int main(int argc, char** argv) {
     }
 
     /* Write .dcmesh file */
-    int exit_code = 1;
     FILE* fout = fopen(output_path, "wb");
     if (!fout) {
         fprintf(stderr, "Error: Cannot open %s for writing\n", output_path);
